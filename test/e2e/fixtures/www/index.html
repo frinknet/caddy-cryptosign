@@ -1,0 +1,11 @@
+{{- $t := "{\"sub\":\"alice\",\"n\":7}" | cryptotoken "e2e-secret" "v1" "1h" -}}
+{{- $c := cryptocheck $t "e2e-secret" -}}
+{{- $ts := now.Unix -}}
+{{- $sig := printf "%d.hello" $ts | cryptosign "e2e-secret" -}}
+{{- $v := cryptocheck "hmac" "e2e-secret" "hello" (printf "t=%d,v1=%s" $ts $sig) 30 -}}
+sub={{ $c.sub }}
+n={{ $c.n }}
+hmac={{ cryptosign "e2e-secret" "hello" }}
+hmac-check={{ if cryptocheck "hmac" "e2e-secret" "hello" "43d81feebc6348e217b222c2664d2fef253ca993112ef260500a93094388ead6" }}ok{{ end }}
+stripe-payload={{ $v.payload }}
+stripe-ts={{ if eq $v.timestamp $ts }}match{{ end }}

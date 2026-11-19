@@ -1,0 +1,18 @@
+{
+	admin localhost:2019
+	auto_https off
+}
+
+:80 {
+	root * /srv/e2e
+	templates {
+		extensions {
+			crypto
+		}
+	}
+	file_server
+
+	handle_errors {
+		respond "error {http.error.status_code}" 500
+	}
+}

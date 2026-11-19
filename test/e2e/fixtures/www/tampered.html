@@ -1,0 +1,5 @@
+{{- $t := "{\"sub\":\"alice\"}" | cryptotoken "e2e-secret" "v1" "1h" -}}
+{{- $parts := splitList "." $t -}}
+{{- $bad := printf "%s.%s.AAAA" (index $parts 0) (index $parts 1) -}}
+{{- cryptocheck $bad "e2e-secret" -}}
+tampered token was accepted
