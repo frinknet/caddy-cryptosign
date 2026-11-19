@@ -28,6 +28,7 @@ const (
 type tokenHeader struct {
 	Alg string `json:"alg"`
 	Kid string `json:"kid,omitempty"`
+	Typ string `json:"typ,omitempty"`
 }
 
 // DeriveKey returns the Ed25519 private key for secret and label. An empty
@@ -97,12 +98,35 @@ func IssueToken(secret, label, claimsJSON, ttl string, now time.Time) (string, e
 	return signingInput + "." + base64.RawURLEncoding.EncodeToString(sig), nil
 }
 
+// CheckOptions narrows what a verified token must contain. Zero values mean
+// "do not check".
+type CheckOptions struct {
+	// Skew tolerates clock drift between issuer and verifier. It widens both
+	// exp and nbf by the same amount. Negative values are rejected.
+	Skew time.Duration
+	// Issuer, when set, must equal the iss claim.
+	Issuer string
+	// Audience, when set, must be the aud claim or one of its entries.
+	Audience string
+	// Type, when set, must equal the typ header.
+	Type string
+}
+
 // CheckToken verifies a compact EdDSA JWT and returns its claims. The signing
 // key is re-derived from secret and the token's kid header. exp and nbf are
-// enforced when present.
+// enforced when present, with no clock skew allowance.
 func CheckToken(token, secret string, now time.Time) (map[string]any, error) {
+	return CheckTokenWithOptions(token, secret, CheckOptions{}, now)
+}
+
+// CheckTokenWithOptions is CheckToken with an explicit clock skew and claim
+// policy. Verification is unchanged unless an option is set.
+func CheckTokenWithOptions(token, secret string, opts CheckOptions, now time.Time) (map[string]any, error) {
 	if secret == "" {
 		return nil, ErrEmptySecret
+	}
+	if opts.Skew < 0 {
+		return nil, fmt.Errorf("cryptosign: clock skew must not be negative")
 	}
 
 	parts := strings.Split(token, ".")
@@ -124,6 +148,9 @@ func CheckToken(token, secret string, now time.Time) (map[string]any, error) {
 	}
 	if header.Kid == "" {
 		return nil, fmt.Errorf("%w: kid is missing", ErrInvalidToken)
+	}
+	if opts.Type != "" && header.Typ != opts.Type {
+		return nil, fmt.Errorf("%w: typ %q is not %q", ErrInvalidToken, header.Typ, opts.Type)
 	}
 
 	key, err := DeriveKey(secret, header.Kid)
@@ -152,13 +179,24 @@ func CheckToken(token, secret string, now time.Time) (map[string]any, error) {
 		return nil, fmt.Errorf("%w: %v", ErrInvalidToken, err)
 	}
 
-	nowSeconds := float64(now.UTC().Unix())
+	if opts.Issuer != "" {
+		iss, _ := claims["iss"].(string)
+		if iss != opts.Issuer {
+			return nil, fmt.Errorf("%w: iss %q is not %q", ErrInvalidToken, iss, opts.Issuer)
+		}
+	}
+	if opts.Audience != "" && !audienceMatches(claims["aud"], opts.Audience) {
+		return nil, fmt.Errorf("%w: aud does not include %q", ErrInvalidToken, opts.Audience)
+	}
+
+	nowSeconds := float64(now.UTC().UnixNano()) / float64(time.Second)
+	skewSeconds := opts.Skew.Seconds()
 	if v, ok := claims["exp"]; ok {
 		exp, err := numberClaim(v, "exp")
 		if err != nil {
 			return nil, fmt.Errorf("%w: %v", ErrInvalidToken, err)
 		}
-		if nowSeconds >= exp {
+		if nowSeconds >= exp+skewSeconds {
 			return nil, ErrExpiredToken
 		}
 	}
@@ -167,12 +205,28 @@ func CheckToken(token, secret string, now time.Time) (map[string]any, error) {
 		if err != nil {
 			return nil, fmt.Errorf("%w: %v", ErrInvalidToken, err)
 		}
-		if nowSeconds < nbf {
+		if nowSeconds+skewSeconds < nbf {
 			return nil, ErrNotYetValid
 		}
 	}
 
 	return claims, nil
+}
+
+// audienceMatches reports whether the aud claim (a string or an array of
+// strings, per RFC 7519) contains want.
+func audienceMatches(v any, want string) bool {
+	switch aud := v.(type) {
+	case string:
+		return aud == want
+	case []any:
+		for _, item := range aud {
+			if s, ok := item.(string); ok && s == want {
+				return true
+			}
+		}
+	}
+	return false
 }
 
 func decodeClaims(claimsJSON string) (map[string]any, error) {

@@ -2,9 +2,10 @@
 
 Stateless cryptographic primitives for [Caddy](https://caddyserver.com)
 templates: mint EdDSA JWTs, sign exact strings with HMAC-SHA256, and verify
-either kind. Secrets are passed at call time by the template or application,
-so key scoping and rotation stay under caller control rather than living in a
-server-global seed.
+either kind. A companion `cryptobody` handler captures raw request bodies so
+webhook signatures can be verified over the exact bytes. Secrets are passed at
+call time by the template or application, so key scoping and rotation stay
+under caller control rather than living in a server-global seed.
 
 ```caddyfile
 example.com {
@@ -24,14 +25,15 @@ example.com {
 signed in as {{ $claims.sub }}
 ```
 
-Caddy module ID: `http.handlers.templates.functions.crypto` (the `crypto`
-extension of the `templates` handler). Source:
+Caddy module IDs: `http.handlers.templates.functions.crypto` (the `crypto`
+extension of the `templates` handler) and `http.handlers.cryptobody`. Source:
 `github.com/frinknet/caddy-cryptosign`.
 
 ## Contents
 
 - [Installation](#installation)
 - [Enabling the functions](#enabling-the-functions)
+- [Raw request body](#raw-request-body)
 - [cryptotoken](#cryptotoken)
 - [cryptosign](#cryptosign)
 - [cryptocheck](#cryptocheck)
@@ -86,6 +88,45 @@ The equivalent JSON is the `crypto` key in the handler's `extensions` map:
 Any template error, including a cryptographic failure, aborts rendering and
 Caddy answers `500` unless `handle_errors` is configured. Verification is
 fail-closed by design.
+
+## Raw request body
+
+Webhook signatures cover the exact request bytes, so any handler that parses
+and re-encodes the body breaks verification. The `cryptobody` directive
+captures the body before other handlers run, restores it for the rest of the
+chain, and exposes it to templates as the request variable `cryptobody`.
+
+```caddyfile
+:80 {
+	root * /srv
+	cryptobody 65536
+	templates {
+		extensions {
+			crypto
+		}
+	}
+	file_server
+}
+```
+
+`cryptobody [<max_size>]` accepts an optional byte limit, default `1048576`. A
+larger body is rejected with `413` rather than truncated. The directive is
+ordered before `templates`, so every template on the request sees the captured
+bytes. It needs no `extensions` entry; module ID `http.handlers.cryptobody`.
+
+Templates read the bytes with Caddy's built-in `placeholder` function:
+
+```gotemplate
+{{ $body := placeholder "http.vars.cryptobody" }}
+{{ $sig := placeholder "http.request.header.Stripe-Signature" }}
+{{ $v := cryptocheck "hmac" "webhook-secret" $body $sig 300 }}
+received {{ $v.payload }}
+```
+
+The variable holds the bytes exactly as received, including key order,
+whitespace, and non-UTF8 bytes. `cryptobody` itself never signs, verifies, or
+rewrites anything. The JSON form is
+`{"handler": "cryptobody", "max_size": 65536}`.
 
 ## cryptotoken
 
@@ -148,7 +189,7 @@ composing the message in the template:
 
 ## cryptocheck
 
-`cryptocheck` has two modes, selected by the first argument.
+`cryptocheck` has three modes, selected by the first argument.
 
 ### JWT verification
 
@@ -166,13 +207,41 @@ composing the message in the template:
 4. Decodes the payload into a claims map with `UseNumber`.
 5. Enforces time claims: `exp` must be strictly in the future and `nbf` must
    not be in the future. Non-numeric `exp`/`nbf` values make the token invalid.
-   There is no built-in clock skew allowance.
+   There is no clock skew allowance unless the `jwt` mode requests one.
 6. Returns the claims map without header fields, so caller claims are never
    shadowed by `alg` or `kid`.
 
 `$secret` must not be empty. Malformed tokens, signature mismatches, wrong
 labels, expired tokens, and not-yet-valid tokens all return errors and abort
 the template.
+
+For clock skew, claim policy, and soft checks, name the `jwt` mode and pass a
+JSON options object, usually `dict ... | toJson`:
+
+```gotemplate
+{{ $claims := cryptocheck "jwt" $token $secret }}
+{{ $claims := cryptocheck "jwt" $token $secret (dict "skew" 30 "iss" "auth.example" "aud" "api" | toJson) }}
+```
+
+| Option | Type | Meaning |
+|--------|------|---------|
+| `skew` | seconds, number or numeric string | Tolerate this much clock drift, widening both `exp` and `nbf`. Must not be negative. |
+| `iss` | string | Require this exact `iss` claim. |
+| `aud` | string | Require the `aud` claim, or one entry of its array, to equal this value. |
+| `typ` | string | Require this exact `typ` header. `cryptotoken` emits none, so set this only for foreign tokens that carry one. |
+| `soft` | boolean | Return a nil claims map instead of an error when verification fails. |
+
+Unknown option names, wrong types, and a negative skew abort rendering, as does
+an empty secret even in soft mode. With `soft`, every cryptographic failure
+(bad signature, expired or not-yet-valid token, policy mismatch, malformed
+token) yields a nil map so the template can render an unauthenticated view:
+
+```gotemplate
+{{ $claims := cryptocheck "jwt" $token "app-secret" (dict "soft" true | toJson) }}
+{{ if $claims }}signed in as {{ $claims.sub }}{{ else }}please sign in{{ end }}
+```
+
+Without `soft`, failures still abort the template.
 
 ### Body / webhook verification
 
@@ -194,17 +263,18 @@ the message.
 
 `$toleranceSec` is only valid with a timestamped header. It accepts an integer,
 float, or numeric string, must not be negative, and requires
-`|now - t| <= tolerance` in whole seconds. Supplying a tolerance with a bare
-digest is an error rather than a silent no-op. Without a tolerance the
-timestamp is still part of the signed string, but its age is not checked.
+`|now - t| <= tolerance` as an exact duration, so sub-second tolerances work.
+Supplying a tolerance with a bare digest is an error rather than a silent
+no-op. Without a tolerance the timestamp is still part of the signed string,
+but its age is not checked.
 
 All digest comparisons use `hmac.Equal`. On success the function returns a map
 with `payload` and, for timestamped headers, `timestamp` as an `int64`.
 `$secret` must not be empty; an empty signature header is an error.
 
 Because the comparison is constant time and any mismatch aborts rendering,
-templates branch on failures through `handle_errors`, not on a boolean from
-`cryptocheck`.
+templates branch on failures through `handle_errors` unless they opt into the
+`jwt` mode's `soft` option.
 
 ## Key derivation
 
@@ -232,9 +302,13 @@ derivation.
 - Secrets are provided per call by the template; the plugin stores none.
 - Signature and digest comparisons use constant-time primitives
   (`ed25519.Verify`, `hmac.Equal`).
-- Verification fails closed: a bad signature, expired token, stale webhook
-  timestamp, invalid duration, or malformed claims aborts rendering with an
-  error instead of returning a falsy value.
+- Verification fails closed by default: a bad signature, expired token, stale
+  webhook timestamp, invalid duration, or malformed claims aborts rendering
+  with an error instead of returning a falsy value. The `jwt` mode's `soft`
+  option is the only way to opt out, and it never hides configuration errors
+  such as an empty secret.
+- `cryptobody` rejects oversized bodies with `413` instead of truncating them,
+  and its size limit is applied before the body is buffered in full.
 - Errors do not include the secret. Keep template error pages generic; Caddy's
   default error page does not echo the rendered input.
 
@@ -248,10 +322,10 @@ Issue a token and read it back:
 {{ $claims.sub }} {{ range $claims.scopes }}{{ . }} {{ end }}
 ```
 
-Verify a body signature, with `$body` already holding the exact bytes captured
-before any handler parsed or rewrote them:
+Verify a raw webhook body, captured before any handler parsed or rewrote it:
 
 ```gotemplate
+{{ $body := placeholder "http.vars.cryptobody" }}
 {{ $sig := placeholder "http.request.header.Stripe-Signature" }}
 {{ $v := cryptocheck "hmac" "webhook-secret" $body $sig 300 }}
 received {{ $v.payload }}
@@ -272,35 +346,35 @@ No host Go toolchain is used. All commands run in
 Caddy `v2.11.9`.
 
 ```sh
-sh test/unit.sh     # gofmt, go vet, go test in the builder image
+sh test/unit.sh     # gofmt, vet, tests, then the race detector
 ./build.sh          # builds <slug>:test from NOTICE
 sh test/e2e.sh      # serves test/e2e/fixtures and compares exact bytes
 ```
 
-`test/e2e.sh` mounts its own Caddyfile and site over the image, checks that the
-module is registered and that the linked Caddy version matches `go.mod`, that
+`test/unit.sh` fails on unformatted code, runs `go vet`, `go test`, and then
+`go test -race`. The race pass needs cgo, so the script installs `gcc` and
+`musl-dev` inside the disposable container; the host still needs no Go
+toolchain. The `CheckToken` and signature-header parsers have fuzz targets in
+`pkg/crypto`; the normal layer exercises only their seed corpus, and
+`go test -fuzz=FuzzCheckToken ./pkg/crypto/` fuzzes them further.
+
+`test/e2e.sh` mounts its own Caddyfile and site over the image, checks that both
+modules are registered and that the linked Caddy version matches `go.mod`, that
 the shipped and fixture configs validate, that an unknown extension is
-rejected, and that token signing, HMAC signing, Stripe-style verification, and
-three failure pages produce exact-byte responses.
-
-The race detector needs cgo and is run separately:
-
-```sh
-docker run --rm -v caddy-sf-mod:/mod -v "$PWD":/src -w /src \
-  -e GOMODCACHE=/mod -e GOCACHE=/mod/gocache -e CGO_ENABLED=1 \
-  caddy:2.11.9-builder-alpine \
-  sh -c 'apk add --no-cache gcc musl-dev && go test -race -timeout=180s ./...'
-```
+rejected, and that exact-byte responses cover token signing, HMAC signing,
+Stripe-style verification, clock skew, soft checks, claim policy, verbatim
+request-body capture, and ten failure pages.
 
 ## Image
 
 `./build.sh` derives the tag from the first line of `NOTICE` and produces
 `caddy-cryptosign:test`. The final stage is `scratch` and contains the Caddy
 binary, toybox, CA certificates, timezone data, licenses, and `www/`.
-`www/Caddyfile` is installed as `/etc/caddy/Caddyfile`; pass
-`run --config /etc/caddy/Caddyfile --adapter caddyfile` to load it. That
-shipped config serves static files and does not enable the crypto extension,
-so mount your own Caddyfile to use the functions. Without `--config`, Caddy
+`www/` is copied to `/srv/www`, so the example Caddyfile is
+`/srv/www/Caddyfile`; pass `run --config /srv/www/Caddyfile --adapter
+caddyfile` to load it. That example serves static files and does not enable
+the crypto extension, so mount your own Caddyfile to use the functions. The
+image installs no config at `/etc/caddy/Caddyfile`; without `--config`, Caddy
 starts with an empty configuration.
 
 The image keeps Caddy's default admin endpoint (`localhost:2019`), which its
@@ -310,12 +384,13 @@ unhealthy.
 ## Layout
 
 - `cryptosign.go`: the only Go file at the repository root; blank-imports the
-  module package so its `init` registration runs in an `xcaddy` build.
+  packages so their `init` registrations run in an `xcaddy` build.
 - `pkg/crypto/`: token issuance and verification, HKDF derivation, HMAC
   signing and checking, and their unit tests.
 - `pkg/tplfuncs/`: the Caddy module, template argument handling, and template
   execution tests.
-- `test/unit.sh`: canonical unit layer in the builder image.
+- `pkg/rawbody/`: the `cryptobody` handler that captures raw request bodies.
+- `test/unit.sh`: canonical unit layer in the builder image, race pass included.
 - `test/e2e.sh`: image-level checks with fixtures under
   `test/e2e/fixtures/`.
 - `www/`: the Caddyfile shipped inside the image.
@@ -323,13 +398,12 @@ unhealthy.
 
 ## Limitations
 
-- Webhook verification takes the payload as a template argument. The plugin
-  does not capture and expose the raw request body itself, so the template must
-  already have those exact bytes.
-- JWT verification has no clock-skew allowance and no keyring/`kid` rotation
-  lookup; the label in the token must equal the label used to derive the key.
-- Verification failures are always fatal to the template. There is no soft
-  "unauthenticated" return value.
+- JWT verification has no keyring or `kid` rotation lookup; the label in the
+  token must equal the label used to derive the key. Beyond `iss`, `aud`, and
+  the `typ` header, further claim policy belongs to the template.
+- `cryptobody` buffers the body in memory up to `max_size`; it is not a
+  streaming body processor and must run before any handler that consumes the
+  body.
 - Token payloads are re-marshaled canonically; signing a pre-serialized JSON
   string byte-for-byte is what `cryptosign` is for.
 

@@ -49,6 +49,13 @@ else
 	fail "image registers http.handlers.templates.functions.crypto"
 fi
 
+if timeout 60 docker run --rm "$IMAGE" list-modules |
+	grep -qx 'http.handlers.cryptobody'; then
+	pass "image registers http.handlers.cryptobody"
+else
+	fail "image registers http.handlers.cryptobody"
+fi
+
 # ── The pinned Caddy version is the one linked into the image ─────────
 WANT_CADDY=$(grep -E '(^|[[:space:]])github\.com/caddyserver/caddy/v2[[:space:]]+v' go.mod |
 	sed 's/.*github\.com\/caddyserver\/caddy\/v2[[:space:]]*\(v[^[:space:]]*\).*/\1/' | head -1)
@@ -69,7 +76,10 @@ else
 	fail "fixture Caddyfile validates"
 fi
 
+# The image copies www/ to /srv/www but installs no /etc/caddy/Caddyfile, so
+# validate the shipped file from the repository through the image's adapter.
 if timeout 60 docker run --rm \
+	-v "$ROOT/www/Caddyfile":/etc/caddy/Caddyfile:ro \
 	"$IMAGE" validate --config /etc/caddy/Caddyfile --adapter caddyfile >/dev/null 2>&1; then
 	pass "shipped Caddyfile validates"
 else
@@ -123,13 +133,24 @@ fi
 if [ "$ready" -eq 1 ]; then
 	if timeout 10 curl -fsS "$BASE/index.html" -o "$TMP/index.got" &&
 		cmp -s "$TMP/index.got" "$FIXTURES/expected/index.txt"; then
-		pass "token, hmac, and stripe verification output matches exactly"
+		pass "token, hmac, stripe, skew, soft, and policy output matches exactly"
 	else
-		fail "token, hmac, and stripe verification output matches exactly"
+		fail "token, hmac, stripe, skew, soft, and policy output matches exactly"
 		diff -u "$FIXTURES/expected/index.txt" "$TMP/index.got" >&2 || true
 	fi
 
-	for page in expired tampered nosecret; do
+	# The raw request body is captured byte-for-byte before templates render;
+	# the page signs and verifies the captured bytes and echoes them back.
+	if printf '%s' '{"b":2, "a":1}' |
+		timeout 10 curl -fsS -X POST --data-binary @- "$BASE/webhook.html" -o "$TMP/webhook.got" &&
+		cmp -s "$TMP/webhook.got" "$FIXTURES/expected/webhook.txt"; then
+		pass "raw webhook body is captured and verified exactly"
+	else
+		fail "raw webhook body is captured and verified exactly"
+		diff -u "$FIXTURES/expected/webhook.txt" "$TMP/webhook.got" >&2 || true
+	fi
+
+	for page in expired tampered nosecret wrongsecret nbf badttl malformed nonobject missingkid audmismatch; do
 		code=$(timeout 10 curl -sS -o "$TMP/$page.got" -w '%{http_code}' "$BASE/$page.html") || code=000
 		if [ "$code" = 500 ] && cmp -s "$TMP/$page.got" "$FIXTURES/expected/error.txt"; then
 			pass "$page page fails closed with 500"

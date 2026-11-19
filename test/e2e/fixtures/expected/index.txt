@@ -4,3 +4,6 @@ hmac=43d81feebc6348e217b222c2664d2fef253ca993112ef260500a93094388ead6
 hmac-check=ok
 stripe-payload=hello
 stripe-ts=match
+skew=alice
+soft=anonymous
+policy=auth.example

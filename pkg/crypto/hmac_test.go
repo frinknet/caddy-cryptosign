@@ -156,3 +156,26 @@ func TestCheckHMACToleranceNeedsTimestamp(t *testing.T) {
 		t.Fatal("tolerance with a bare digest was accepted")
 	}
 }
+
+func TestCheckHMACSubSecondTolerance(t *testing.T) {
+	const (
+		payload = "body"
+		ts      = int64(1700000000)
+	)
+	digest, err := SignHMAC("s3cr3t", "1700000000."+payload)
+	if err != nil {
+		t.Fatalf("SignHMAC: %v", err)
+	}
+	header := "t=1700000000,v1=" + digest
+	now := time.Unix(ts, 0).Add(500 * time.Millisecond)
+
+	if _, err := CheckHMAC("s3cr3t", payload, header, 500*time.Millisecond, now); err != nil {
+		t.Fatalf("500ms offset with a 500ms tolerance: %v", err)
+	}
+	if _, err := CheckHMAC("s3cr3t", payload, header, 250*time.Millisecond, now); !errors.Is(err, ErrTimestampOutOfTolerance) {
+		t.Fatalf("250ms tolerance error = %v, want ErrTimestampOutOfTolerance", err)
+	}
+	if _, err := CheckHMAC("s3cr3t", payload, header, 500*time.Microsecond, now); !errors.Is(err, ErrTimestampOutOfTolerance) {
+		t.Fatalf("microsecond tolerance error = %v, want ErrTimestampOutOfTolerance", err)
+	}
+}

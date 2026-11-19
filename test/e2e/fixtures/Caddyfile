@@ -5,11 +5,22 @@
 
 :80 {
 	root * /srv/e2e
+
+	@webhook {
+		method POST
+		path /webhook.html
+	}
+
+	cryptobody 65536
+
 	templates {
 		extensions {
 			crypto
 		}
 	}
+
+	respond @webhook "{{include \"/webhook.html\"}}" 200
+
 	file_server
 
 	handle_errors {

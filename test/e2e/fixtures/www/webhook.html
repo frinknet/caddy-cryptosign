@@ -1,0 +1,4 @@
+{{- $body := placeholder "http.vars.cryptobody" -}}
+{{- $sig := cryptosign "webhook-secret" $body -}}
+{{- $v := cryptocheck "hmac" "webhook-secret" $body $sig -}}
+payload=[{{ $v.payload }}]

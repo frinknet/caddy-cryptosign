@@ -28,7 +28,8 @@ func SignHMAC(secret, payload string) (string, error) {
 // accepted for key rotation) over payload, or a Stripe-style header such as
 // "t=1700000000,v1=<hex>" in which case the signed string is
 // "<timestamp>.<payload>". When a timestamp is present and tolerance is
-// positive, the timestamp must be within tolerance of now.
+// positive, the timestamp must be within tolerance of now; the comparison is
+// exact, so sub-second tolerances are honored.
 //
 // On success the returned map holds "payload" and, for Stripe-style headers,
 // "timestamp" as an int64.
@@ -60,11 +61,11 @@ func CheckHMAC(secret, payload, sigHeader string, tolerance time.Duration, now t
 		signed = strconv.FormatInt(ts, 10) + "." + payload
 
 		if tolerance > 0 {
-			delta := now.UTC().Unix() - ts
+			delta := now.Sub(time.Unix(ts, 0))
 			if delta < 0 {
-				delta = ts - now.UTC().Unix()
+				delta = -delta
 			}
-			if delta > int64(tolerance/time.Second) {
+			if delta > tolerance {
 				return nil, ErrTimestampOutOfTolerance
 			}
 		}

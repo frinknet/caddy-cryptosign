@@ -7,6 +7,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"io"
 	"math"
 	"strconv"
 	"strings"
@@ -112,13 +113,19 @@ func signHMAC(secret, payload string) (string, error) {
 // check implements
 //
 //	{{ cryptocheck $token $secret }}
+//	{{ cryptocheck "jwt" $token $secret [$options] }}
 //	{{ cryptocheck "hmac" $secret $payload $sigHeader [$toleranceSec] }}
 func check(args ...any) (map[string]any, error) {
 	if len(args) == 0 {
 		return nil, errors.New("cryptocheck: missing arguments")
 	}
-	if mode, ok := args[0].(string); ok && mode == "hmac" {
-		return checkHMAC(args[1:])
+	if mode, ok := args[0].(string); ok {
+		switch mode {
+		case "hmac":
+			return checkHMAC(args[1:])
+		case "jwt":
+			return checkJWT(args[1:])
+		}
 	}
 
 	if len(args) != 2 {
@@ -133,6 +140,111 @@ func check(args ...any) (map[string]any, error) {
 		return nil, fmt.Errorf("cryptocheck: secret: %w", err)
 	}
 	return crypto.CheckToken(token, secret, time.Now())
+}
+
+// checkJWT implements the options-aware JWT mode:
+//
+//	{{ cryptocheck "jwt" $token $secret [$optionsJSON] }}
+//
+// Options: skew (seconds), iss, aud, typ, soft (bool). A soft check returns a
+// nil claims map and no error when the token cannot be verified, which lets a
+// template render an unauthenticated view. An empty secret is always a hard
+// error.
+func checkJWT(args []any) (map[string]any, error) {
+	if len(args) < 2 || len(args) > 3 {
+		return nil, fmt.Errorf("cryptocheck jwt: expected a token, a secret, and optional options, got %d arguments", len(args))
+	}
+	token, err := stringArg(args[0])
+	if err != nil {
+		return nil, fmt.Errorf("cryptocheck jwt: token: %w", err)
+	}
+	secret, err := stringArg(args[1])
+	if err != nil {
+		return nil, fmt.Errorf("cryptocheck jwt: secret: %w", err)
+	}
+	if secret == "" {
+		return nil, crypto.ErrEmptySecret
+	}
+
+	var (
+		opts crypto.CheckOptions
+		soft bool
+	)
+	if len(args) == 3 {
+		optionsJSON, err := stringArg(args[2])
+		if err != nil {
+			return nil, fmt.Errorf("cryptocheck jwt: options: %w", err)
+		}
+		opts, soft, err = parseCheckOptions(optionsJSON)
+		if err != nil {
+			return nil, fmt.Errorf("cryptocheck jwt: options: %w", err)
+		}
+	}
+
+	claims, err := crypto.CheckTokenWithOptions(token, secret, opts, time.Now())
+	if err != nil {
+		if soft {
+			return nil, nil
+		}
+		return nil, err
+	}
+	return claims, nil
+}
+
+func parseCheckOptions(optionsJSON string) (crypto.CheckOptions, bool, error) {
+	var opts crypto.CheckOptions
+	dec := json.NewDecoder(strings.NewReader(optionsJSON))
+	dec.UseNumber()
+	var raw map[string]any
+	if err := dec.Decode(&raw); err != nil {
+		return opts, false, fmt.Errorf("invalid options JSON: %w", err)
+	}
+	var extra any
+	if err := dec.Decode(&extra); !errors.Is(err, io.EOF) {
+		return opts, false, errors.New("invalid options JSON: trailing data")
+	}
+
+	soft := false
+	for key, value := range raw {
+		switch key {
+		case "skew":
+			seconds, err := secondsArg(value)
+			if err != nil {
+				return opts, false, fmt.Errorf("skew: %w", err)
+			}
+			if seconds < 0 {
+				return opts, false, errors.New("skew must not be negative")
+			}
+			opts.Skew = time.Duration(seconds * float64(time.Second))
+		case "iss":
+			s, err := stringArg(value)
+			if err != nil {
+				return opts, false, fmt.Errorf("iss: %w", err)
+			}
+			opts.Issuer = s
+		case "aud":
+			s, err := stringArg(value)
+			if err != nil {
+				return opts, false, fmt.Errorf("aud: %w", err)
+			}
+			opts.Audience = s
+		case "typ":
+			s, err := stringArg(value)
+			if err != nil {
+				return opts, false, fmt.Errorf("typ: %w", err)
+			}
+			opts.Type = s
+		case "soft":
+			b, ok := value.(bool)
+			if !ok {
+				return opts, false, fmt.Errorf("soft: expected a boolean, got %T", value)
+			}
+			soft = b
+		default:
+			return opts, false, fmt.Errorf("unknown option %q", key)
+		}
+	}
+	return opts, soft, nil
 }
 
 func checkHMAC(args []any) (map[string]any, error) {

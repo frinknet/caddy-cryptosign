@@ -1,0 +1,3 @@
+{{- $t := "{\"nbf\":4102444800}" | cryptotoken "e2e-secret" "v1" -}}
+{{- cryptocheck $t "e2e-secret" -}}
+future token was accepted

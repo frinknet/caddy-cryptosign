@@ -3,9 +3,17 @@
 {{- $ts := now.Unix -}}
 {{- $sig := printf "%d.hello" $ts | cryptosign "e2e-secret" -}}
 {{- $v := cryptocheck "hmac" "e2e-secret" "hello" (printf "t=%d,v1=%s" $ts $sig) 30 -}}
+{{- $expired := "{\"sub\":\"alice\"}" | cryptotoken "e2e-secret" "v1" "-1s" -}}
+{{- $skewed := cryptocheck "jwt" $expired "e2e-secret" "{\"skew\":60}" -}}
+{{- $anon := cryptocheck "jwt" $expired "e2e-secret" "{\"soft\":true}" -}}
+{{- $policy := "{\"iss\":\"auth.example\",\"aud\":\"api\"}" | cryptotoken "e2e-secret" "v1" "1h" -}}
+{{- $checked := cryptocheck "jwt" $policy "e2e-secret" "{\"iss\":\"auth.example\",\"aud\":\"api\"}" -}}
 sub={{ $c.sub }}
 n={{ $c.n }}
 hmac={{ cryptosign "e2e-secret" "hello" }}
 hmac-check={{ if cryptocheck "hmac" "e2e-secret" "hello" "43d81feebc6348e217b222c2664d2fef253ca993112ef260500a93094388ead6" }}ok{{ end }}
 stripe-payload={{ $v.payload }}
 stripe-ts={{ if eq $v.timestamp $ts }}match{{ end }}
+skew={{ $skewed.sub }}
+soft={{ if $anon }}claims{{ else }}anonymous{{ end }}
+policy={{ $checked.iss }}

@@ -97,6 +97,67 @@ func TestCryptocheckHMACStripeStyle(t *testing.T) {
 	}
 }
 
+func TestCryptocheckJWTMode(t *testing.T) {
+	source := `{{ $t := "{\"sub\":\"alice\"}" | cryptotoken "s3cr3t" "v1" "1h" }}` +
+		`{{ $c := cryptocheck "jwt" $t "s3cr3t" }}{{ $c.sub }}`
+	if got := renderOK(t, source, nil); got != "alice" {
+		t.Fatalf("got %q", got)
+	}
+}
+
+func TestCryptocheckJWTPolicy(t *testing.T) {
+	source := `{{ $t := "{\"sub\":\"alice\",\"iss\":\"auth.example\",\"aud\":\"api\"}" | cryptotoken "s3cr3t" "v1" "1h" }}` +
+		`{{ $c := cryptocheck "jwt" $t "s3cr3t" "{\"iss\":\"auth.example\",\"aud\":\"api\"}" }}{{ $c.sub }}`
+	if got := renderOK(t, source, nil); got != "alice" {
+		t.Fatalf("got %q", got)
+	}
+
+	for _, options := range []string{
+		`{"iss":"other.example"}`,
+		`{"aud":"admin"}`,
+		`{"typ":"JWT"}`,
+		`{"skew":-1}`,
+		`{"unknown":1}`,
+		`[1]`,
+		`{"soft":"yes"}`,
+	} {
+		t.Run(options, func(t *testing.T) {
+			src := `{{ $t := "{\"sub\":\"alice\",\"iss\":\"auth.example\"}" | cryptotoken "s3cr3t" "v1" "1h" }}` +
+				`{{ cryptocheck "jwt" $t "s3cr3t" ` + strconv.Quote(options) + ` }}`
+			if _, err := render(t, src, nil); err == nil {
+				t.Fatal("template succeeded, want error")
+			}
+		})
+	}
+}
+
+func TestCryptocheckJWTSkewAndSoft(t *testing.T) {
+	source := `{{ $t := "{\"sub\":\"alice\"}" | cryptotoken "s3cr3t" "v1" "-1s" }}` +
+		`{{ $c := cryptocheck "jwt" $t "s3cr3t" "{\"skew\":60}" }}{{ $c.sub }}`
+	if got := renderOK(t, source, nil); got != "alice" {
+		t.Fatalf("skewed check: got %q", got)
+	}
+
+	soft := `{{ $t := "{\"sub\":\"alice\"}" | cryptotoken "s3cr3t" "v1" "-1s" }}` +
+		`{{ $c := cryptocheck "jwt" $t "s3cr3t" "{\"soft\":true}" }}` +
+		`{{ if $c }}signed in{{ else }}anonymous{{ end }}`
+	if got := renderOK(t, soft, nil); got != "anonymous" {
+		t.Fatalf("soft check: got %q", got)
+	}
+
+	// A soft check still treats an empty secret as a hard error.
+	hard := `{{ cryptocheck "jwt" "not.a.token" "" "{\"soft\":true}" }}`
+	if _, err := render(t, hard, nil); err == nil {
+		t.Fatal("soft check accepted an empty secret")
+	}
+
+	// Without soft, the same expired token aborts the template.
+	abort := `{{ $t := "{\"sub\":\"alice\"}" | cryptotoken "s3cr3t" "v1" "-1s" }}{{ cryptocheck "jwt" $t "s3cr3t" }}`
+	if _, err := render(t, abort, nil); err == nil {
+		t.Fatal("expired token rendered without soft")
+	}
+}
+
 func TestFailuresAbortTemplate(t *testing.T) {
 	tests := []struct {
 		name   string
